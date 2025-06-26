@@ -219,13 +219,13 @@ setup_micromamba_environment() {
         # 2. 激活环境配置
         echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc
         
-        # 3. 创建.condarc配置文件
+        # 3. 创建.condarc配置文件（仅使用开源频道）
         cat > .condarc << 'EOL'
 channels:
   - conda-forge
-  - defaults
 always_yes: true
 auto_activate_base: false
+channel_priority: strict
 EOL
     "
     
@@ -373,6 +373,130 @@ detect_openvpn_config() {
     echo "$openvpn_base_dir|$openvpn_server_dir|$openvpn_client_dir|$config_structure"
 }
 
+# 交互式输入网段配置
+get_network_config() {
+    local default_network="192.168.200.0/24"
+    local default_server="192.168.200.0"
+    local default_netmask="255.255.255.0"
+    local default_route="192.168.200.0"
+    
+    echo
+    echo "========================================"
+    log_info "配置OpenVPN网段"
+    echo "========================================"
+    echo -n "请输入VPN网段 (默认: $default_network): "
+    read -r input_network
+    
+    if [ -z "$input_network" ]; then
+        input_network="$default_network"
+    fi
+    
+    # 验证网段格式
+    if ! echo "$input_network" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'; then
+        log_error "网段格式错误，使用默认网段: $default_network"
+        input_network="$default_network"
+    fi
+    
+    # 解析网段信息
+    local network_ip=$(echo "$input_network" | cut -d'/' -f1)
+    local cidr=$(echo "$input_network" | cut -d'/' -f2)
+    
+    # 计算子网掩码
+    local netmask=""
+    case "$cidr" in
+        24) netmask="255.255.255.0" ;;
+        16) netmask="255.255.0.0" ;;
+        8)  netmask="255.0.0.0" ;;
+        *)  netmask="255.255.255.0" ;;
+    esac
+    
+    log_info "使用网段: $input_network"
+    log_info "服务器IP: $network_ip"
+    log_info "子网掩码: $netmask"
+    
+    # 导出全局变量
+    export VPN_NETWORK="$input_network"
+    export VPN_SERVER_IP="$network_ip"
+    export VPN_NETMASK="$netmask"
+    export VPN_ROUTE_IP="$network_ip"
+}
+
+# 配置OpenVPN服务器
+configure_openvpn_server() {
+    local openvpn_info=$(detect_openvpn_config)
+    IFS='|' read -r openvpn_base openvpn_server openvpn_client openvpn_structure <<< "$openvpn_info"
+    
+    if [ -z "$openvpn_base" ] || [ ! -d "$openvpn_base" ]; then
+        log_error "未找到OpenVPN配置目录"
+        return 1
+    fi
+    
+    # 确定目标配置目录
+    local target_config_dir=""
+    if [ "$openvpn_structure" = "separated" ] && [ -n "$openvpn_server" ]; then
+        target_config_dir="$openvpn_server"
+    else
+        target_config_dir="$openvpn_base"
+    fi
+    
+    log_info "OpenVPN配置目录: $target_config_dir"
+    
+    # 检查源配置文件
+    local source_config="configs/server.conf"
+    if [ ! -f "$source_config" ]; then
+        log_error "源配置文件不存在: $source_config"
+        return 1
+    fi
+    
+    # 创建临时配置文件
+    local temp_config="/tmp/server.conf.tmp"
+    cp "$source_config" "$temp_config"
+    
+    # 修改网段配置
+    log_info "修改OpenVPN服务器网段配置..."
+    
+    # 替换server配置行
+    sed -i "s/^server [0-9.]* [0-9.]*$/server $VPN_SERVER_IP $VPN_NETMASK/" "$temp_config"
+    
+    # 替换route推送配置（如果存在）
+    sed -i "s/^push \"route [0-9.]* [0-9.]*\"$/push \"route $VPN_ROUTE_IP $VPN_NETMASK\"/" "$temp_config"
+    
+    # 在配置文件顶部添加网段注释
+    sed -i "s|^# Network: .*|# Network: $VPN_NETWORK|" "$temp_config"
+    
+    # 复制配置文件到OpenVPN目录
+    local target_config_file="$target_config_dir/server.conf"
+    
+    if cp "$temp_config" "$target_config_file" 2>/dev/null; then
+        log_info "OpenVPN服务器配置已更新: $target_config_file"
+        
+        # 设置正确的权限
+        chmod 644 "$target_config_file"
+        
+        # 显示修改的内容
+        echo
+        log_info "配置文件关键设置:"
+        echo "----------------------------------------"
+        grep "^# Network:" "$target_config_file" || echo "# Network: $VPN_NETWORK"
+        grep "^server " "$target_config_file"
+        grep "^push.*route" "$target_config_file" || true
+        echo "----------------------------------------"
+        
+    else
+        log_error "复制配置文件失败: $target_config_file"
+        return 1
+    fi
+    
+    # 清理临时文件
+    rm -f "$temp_config"
+    
+    # 保存配置到全局变量用于JSON生成
+    export OPENVPN_CONFIG_FILE="$target_config_file"
+    export OPENVPN_CONFIG_DIR="$target_config_dir"
+    
+    return 0
+}
+
 # 生成JSON配置文件
 generate_config_file() {
     local output_file="environment_config.json"
@@ -458,9 +582,17 @@ generate_config_file() {
     "activation_command": "micromamba activate pyuser",
     "gunicorn_path": "$pyuser_home/mamba_root/envs/pyuser/bin/gunicorn"
   },
+  "vpn_network_config": {
+    "network": "${VPN_NETWORK:-null}",
+    "server_ip": "${VPN_SERVER_IP:-null}",
+    "netmask": "${VPN_NETMASK:-null}",
+    "route_ip": "${VPN_ROUTE_IP:-null}",
+    "config_file": "${OPENVPN_CONFIG_FILE:-null}",
+    "config_directory": "${OPENVPN_CONFIG_DIR:-null}"
+  },
   "flask_api_recommendations": {
     "nginx_config_target": "${nginx_conf_dir:-$nginx_main}",
-    "openvpn_config_target": "${openvpn_server:-$openvpn_base}",
+    "openvpn_config_target": "${OPENVPN_CONFIG_DIR:-${openvpn_server:-$openvpn_base}}",
     "python_user": "pyuser",
     "python_environment": "pyuser",
     "gunicorn_binary": "$pyuser_home/mamba_root/envs/pyuser/bin/gunicorn",
@@ -549,16 +681,33 @@ main() {
         log_info "Python环境已配置"
     fi
     
+    # 配置VPN网段
+    get_network_config
+    
+    # 配置OpenVPN服务器
+    if [ "$EUID" -eq 0 ]; then
+        if ! configure_openvpn_server; then
+            log_error "配置OpenVPN服务器失败"
+            exit 1
+        fi
+    else
+        log_error "需要root权限配置OpenVPN服务器"
+        exit 1
+    fi
+    
     # 生成配置文件
     generate_config_file
     
-    log_info "环境检测完成!"
+    log_info "环境检测和配置完成!"
     
     # 显示配置摘要
     echo
     echo "配置摘要:"
     echo "========================================"
     if [ -f environment_config.json ]; then
+        echo "VPN网段: ${VPN_NETWORK:-未配置}"
+        echo "VPN服务器IP: ${VPN_SERVER_IP:-未配置}"
+        echo "OpenVPN配置文件: ${OPENVPN_CONFIG_FILE:-未配置}"
         echo "Nginx配置位置: $(grep -o '"nginx_config_target": "[^"]*"' environment_config.json | cut -d'"' -f4)"
         echo "OpenVPN配置位置: $(grep -o '"openvpn_config_target": "[^"]*"' environment_config.json | cut -d'"' -f4)"
         echo "Python用户: $(grep -o '"python_user": "[^"]*"' environment_config.json | cut -d'"' -f4)"
@@ -566,6 +715,15 @@ main() {
         echo "Gunicorn路径: $(grep -o '"gunicorn_binary": "[^"]*"' environment_config.json | cut -d'"' -f4)"
         echo "推荐工作目录: $(grep -o '"working_directory": "[^"]*"' environment_config.json | cut -d'"' -f4)"
     fi
+    
+    # 显示OpenVPN重启提示
+    echo
+    echo "重要提示:"
+    echo "========================================"
+    log_info "请重启OpenVPN服务以应用新配置:"
+    echo "  systemctl restart openvpn@server"
+    echo "或者:"
+    echo "  systemctl restart openvpn"
 }
 
 # 脚本入口
