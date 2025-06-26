@@ -1,0 +1,40 @@
+[Unit]
+Description=VPN User API MySQL Service
+Documentation=https://github.com/example/vpn-user-api
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=exec
+User=pyuser
+Group=pyuser
+WorkingDirectory=/etc/openvpn/users
+ExecStartPre=/bin/mkdir -p /dev/shm/vpnapi
+ExecStartPre=/bin/chown pyuser:pyuser /dev/shm/vpnapi
+ExecStart=/home/pyuser/.local/bin/micromamba run -n pyuser gunicorn --config gunicorn_mysql.conf.py vpn_user_api_mysql:app
+ExecReload=/bin/kill -s HUP $MAINPID
+ExecStop=/bin/kill -s TERM $MAINPID
+TimeoutStartSec=30
+TimeoutStopSec=5
+KillMode=mixed
+PrivateTmp=true
+Restart=always
+RestartSec=10
+
+# 安全配置
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/etc/openvpn/users /dev/shm/vpnapi /var/log/gunicorn /var/run/gunicorn /home/pyuser
+
+# 环境变量文件
+EnvironmentFile=/etc/openvpn/users/.env
+
+# 环境变量
+Environment=PYTHONPATH=/etc/openvpn/users
+Environment=PYTHONUNBUFFERED=1
+
+# 资源限制
+LimitNOFILE=65536
+
+[Install]
