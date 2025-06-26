@@ -421,6 +421,191 @@ get_network_config() {
     export VPN_ROUTE_IP="$network_ip"
 }
 
+# 生成OpenVPN证书
+generate_openvpn_certificates() {
+    local target_config_dir="$1"
+    
+    if [ -z "$target_config_dir" ] || [ ! -d "$target_config_dir" ]; then
+        log_error "OpenVPN配置目录无效: $target_config_dir"
+        return 1
+    fi
+    
+    log_info "正在生成OpenVPN证书..."
+    
+    # 创建临时目录用于证书生成
+    local temp_cert_dir="/tmp/openvpn_certs_$(date +%s)"
+    mkdir -p "$temp_cert_dir"
+    cd "$temp_cert_dir"
+    
+    # 生成CA私钥
+    log_info "生成CA私钥..."
+    openssl genrsa -out ca.key 4096
+    
+    # 生成CA证书
+    log_info "生成CA证书..."
+    openssl req -new -x509 -days 3650 -key ca.key -out ca.crt -subj "/C=CN/ST=Beijing/L=Beijing/O=YC-VPN/OU=IT/CN=YC-VPN-CA"
+    
+    # 生成服务器私钥
+    log_info "生成服务器私钥..."
+    openssl genrsa -out server.key 4096
+    
+    # 生成服务器证书请求
+    log_info "生成服务器证书请求..."
+    openssl req -new -key server.key -out server.csr -subj "/C=CN/ST=Beijing/L=Beijing/O=YC-VPN/OU=IT/CN=server"
+    
+    # 生成服务器证书
+    log_info "生成服务器证书..."
+    openssl x509 -req -days 3650 -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt
+    
+    # 生成DH参数
+    log_info "生成DH参数..."
+    openssl dhparam -out dh.pem 2048
+    
+    # 生成TLS认证密钥
+    log_info "生成TLS认证密钥..."
+    openvpn --genkey --secret ta.key
+    
+    # 复制证书到OpenVPN配置目录
+    log_info "复制证书到OpenVPN配置目录..."
+    cp ca.crt server.crt server.key dh.pem ta.key "$target_config_dir/"
+    
+    # 设置正确的权限
+    chmod 644 "$target_config_dir"/ca.crt
+    chmod 644 "$target_config_dir"/server.crt
+    chmod 600 "$target_config_dir"/server.key
+    chmod 644 "$target_config_dir"/dh.pem
+    chmod 600 "$target_config_dir"/ta.key
+    
+    # 清理临时目录
+    cd /
+    rm -rf "$temp_cert_dir"
+    
+    log_info "OpenVPN证书生成完成"
+    
+    # 列出生成的证书文件
+    echo
+    log_info "生成的证书文件:"
+    echo "----------------------------------------"
+    ls -la "$target_config_dir"/{ca.crt,server.crt,server.key,dh.pem,ta.key} 2>/dev/null || true
+    echo "----------------------------------------"
+    
+    return 0
+}
+
+# 启动OpenVPN服务
+start_openvpn_service() {
+    local target_config_dir="$1"
+    local config_file="$target_config_dir/server.conf"
+    
+    if [ ! -f "$config_file" ]; then
+        log_error "OpenVPN配置文件不存在: $config_file"
+        return 1
+    fi
+    
+    log_info "启动OpenVPN服务..."
+    
+    # 创建日志目录
+    mkdir -p /var/log/openvpn
+    
+    # 创建状态文件目录
+    mkdir -p "$(dirname "$target_config_dir")"
+    
+    # 检查服务文件类型
+    if [ -d /etc/systemd/system ]; then
+        # 使用systemd管理
+        local service_name=""
+        if [ "$target_config_dir" = "/etc/openvpn/server" ]; then
+            service_name="openvpn-server@server"
+        else
+            service_name="openvpn@server"
+        fi
+        
+        # 启用并启动服务
+        systemctl enable "$service_name" >/dev/null 2>&1 || true
+        systemctl start "$service_name"
+        
+        # 检查服务状态
+        if systemctl is-active --quiet "$service_name"; then
+            log_info "OpenVPN服务启动成功: $service_name"
+            systemctl status "$service_name" --no-pager -l
+        else
+            log_error "OpenVPN服务启动失败"
+            systemctl status "$service_name" --no-pager -l
+            return 1
+        fi
+    else
+        # 传统方式启动
+        openvpn --config "$config_file" --daemon
+        log_info "OpenVPN服务已启动 (daemon模式)"
+    fi
+    
+    return 0
+}
+
+# 备份现有OpenVPN配置
+backup_existing_openvpn_config() {
+    local target_config_dir="$1"
+    
+    if [ -z "$target_config_dir" ] || [ ! -d "$target_config_dir" ]; then
+        return 0
+    fi
+    
+    # 检查是否存在现有配置文件
+    local existing_files=(
+        "$target_config_dir/server.conf"
+        "$target_config_dir/ca.crt"
+        "$target_config_dir/server.crt"
+        "$target_config_dir/server.key"
+        "$target_config_dir/dh.pem"
+        "$target_config_dir/ta.key"
+    )
+    
+    local has_existing_config=false
+    for file in "${existing_files[@]}"; do
+        if [ -f "$file" ]; then
+            has_existing_config=true
+            break
+        fi
+    done
+    
+    if [ "$has_existing_config" = true ]; then
+        local backup_dir="$target_config_dir/backup_$(date +%Y%m%d_%H%M%S)"
+        log_info "发现现有OpenVPN配置，正在备份到: $backup_dir"
+        
+        mkdir -p "$backup_dir"
+        
+        # 备份所有配置文件
+        for file in "${existing_files[@]}"; do
+            if [ -f "$file" ]; then
+                local filename=$(basename "$file")
+                cp "$file" "$backup_dir/$filename"
+                log_info "已备份: $filename"
+            fi
+        done
+        
+        # 备份其他可能的配置文件
+        if [ -f "$target_config_dir/openvpn_auth.py" ]; then
+            cp "$target_config_dir/openvpn_auth.py" "$backup_dir/"
+            log_info "已备份: openvpn_auth.py"
+        fi
+        
+        # 记录备份信息
+        echo "备份时间: $(date)" > "$backup_dir/backup_info.txt"
+        echo "原始配置目录: $target_config_dir" >> "$backup_dir/backup_info.txt"
+        echo "备份原因: 安装新的OpenVPN配置" >> "$backup_dir/backup_info.txt"
+        
+        log_info "配置备份完成"
+        
+        # 设置备份目录环境变量供JSON配置使用
+        export OPENVPN_BACKUP_DIR="$backup_dir"
+        
+        return 0
+    else
+        log_info "未发现现有OpenVPN配置，无需备份"
+        return 0
+    fi
+}
+
 # 配置OpenVPN服务器
 configure_openvpn_server() {
     local openvpn_info=$(detect_openvpn_config)
@@ -440,6 +625,12 @@ configure_openvpn_server() {
     fi
     
     log_info "OpenVPN配置目录: $target_config_dir"
+    
+    # 备份现有配置
+    if ! backup_existing_openvpn_config "$target_config_dir"; then
+        log_error "备份现有OpenVPN配置失败"
+        return 1
+    fi
     
     # 检查源配置文件
     local source_config="configs/server.conf"
@@ -588,7 +779,8 @@ generate_config_file() {
     "netmask": "${VPN_NETMASK:-null}",
     "route_ip": "${VPN_ROUTE_IP:-null}",
     "config_file": "${OPENVPN_CONFIG_FILE:-null}",
-    "config_directory": "${OPENVPN_CONFIG_DIR:-null}"
+    "config_directory": "${OPENVPN_CONFIG_DIR:-null}",
+    "backup_directory": "${OPENVPN_BACKUP_DIR:-null}"
   },
   "flask_api_recommendations": {
     "nginx_config_target": "${nginx_conf_dir:-$nginx_main}",
@@ -690,6 +882,18 @@ main() {
             log_error "配置OpenVPN服务器失败"
             exit 1
         fi
+        
+        # 生成OpenVPN证书
+        if ! generate_openvpn_certificates "$OPENVPN_CONFIG_DIR"; then
+            log_error "生成OpenVPN证书失败"
+            exit 1
+        fi
+        
+        # 启动OpenVPN服务
+        if ! start_openvpn_service "$OPENVPN_CONFIG_DIR"; then
+            log_error "启动OpenVPN服务失败"
+            exit 1
+        fi
     else
         log_error "需要root权限配置OpenVPN服务器"
         exit 1
@@ -708,6 +912,9 @@ main() {
         echo "VPN网段: ${VPN_NETWORK:-未配置}"
         echo "VPN服务器IP: ${VPN_SERVER_IP:-未配置}"
         echo "OpenVPN配置文件: ${OPENVPN_CONFIG_FILE:-未配置}"
+        if [ -n "${OPENVPN_BACKUP_DIR:-}" ]; then
+            echo "原配置备份位置: ${OPENVPN_BACKUP_DIR}"
+        fi
         echo "Nginx配置位置: $(grep -o '"nginx_config_target": "[^"]*"' environment_config.json | cut -d'"' -f4)"
         echo "OpenVPN配置位置: $(grep -o '"openvpn_config_target": "[^"]*"' environment_config.json | cut -d'"' -f4)"
         echo "Python用户: $(grep -o '"python_user": "[^"]*"' environment_config.json | cut -d'"' -f4)"
@@ -716,14 +923,18 @@ main() {
         echo "推荐工作目录: $(grep -o '"working_directory": "[^"]*"' environment_config.json | cut -d'"' -f4)"
     fi
     
-    # 显示OpenVPN重启提示
+    # 显示OpenVPN服务状态
     echo
-    echo "重要提示:"
+    echo "服务状态:"
     echo "========================================"
-    log_info "请重启OpenVPN服务以应用新配置:"
-    echo "  systemctl restart openvpn@server"
+    log_info "OpenVPN服务已自动启动并配置完成"
+    log_info "如需重启服务，可使用以下命令:"
+    echo "  systemctl restart openvpn-server@server"
     echo "或者:"
-    echo "  systemctl restart openvpn"
+    echo "  systemctl restart openvpn@server"
+    echo
+    log_info "查看服务状态:"
+    echo "  systemctl status openvpn-server@server"
 }
 
 # 脚本入口
